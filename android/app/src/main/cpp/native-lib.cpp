@@ -12,12 +12,29 @@
 using namespace cv;
 using namespace std;
 
+// CONFIG: Single place to adjust capture distance
+// 0.5 = 50% overlap between adjacent photos
+// Higher = closer photos. Lower = photos further apart.
+const double TARGET_OVERLAP = 0.1;
+
 // Struct to explicitly store frame metadata for grid-aware stitching
 struct CapturedFrame {
   Mat image;
   int row;
   int col;
 };
+
+std::string getExcelColumnName(int col) {
+  if (col <= 0)
+    return "X";
+  std::string name = "";
+  while (col > 0) {
+    int mod = (col - 1) % 26;
+    name = (char)('A' + mod) + name;
+    col = (col - mod) / 26;
+  }
+  return name;
+}
 
 // In-memory store of captured RGB frames with grid coordinates
 std::vector<CapturedFrame> capturedFrames;
@@ -60,10 +77,13 @@ Java_com_example_shelf_1scanner_MainActivity_processFrameNative(
   cvtColor(downscaledTarget, grayFrame, COLOR_BGR2GRAY);
 
   double min_dim = std::min(downscaledTarget.cols, downscaledTarget.rows);
-  // 0.35 corresponds to a 65% frame overlap. This balances taking too many
-  // photos (which annoyed the user) with having enough overlap for OpenCV to
-  // not fail!
-  double overlapRatioTrigger = min_dim * 0.35;
+
+  // STRIDE = (1.0 - OVERLAP) * FrameWidth
+  // If overlap is 50% (0.5), we move 50% of the width before capturing next.
+  // Note: Using min_dim because tracking happens in the downscaled (0.5x)
+  // space.
+  double strideRatio = 1.0 - TARGET_OVERLAP;
+  double overlapRatioTrigger = min_dim * strideRatio;
 
   if (previousFrameDownscaled.empty()) {
     previousFrameDownscaled = grayFrame.clone();
@@ -142,8 +162,47 @@ Java_com_example_shelf_1scanner_MainActivity_processFrameNative(
           std::chrono::system_clock::now().time_since_epoch())
           .count();
 
-  if (distance >= overlapRatioTrigger * 0.85 &&
-      distance < overlapRatioTrigger * 1.5) {
+  if (forceCapture) {
+    // Force final capture.
+    // Increased threshold to 50 pixels to ensure we don't capture the same spot
+    // twice.
+    if (distance > 50.0) {
+      // Be more sensitive to direction prediction during a final forced
+      // capture. Even a 10% move towards the next slot should trigger a
+      // coordinate change.
+      if (abs(dx_from_last) > abs(dy_from_last) * 1.1 &&
+          distance > overlapRatioTrigger * 0.1) {
+        if (dx_from_last > 0 && allowRight)
+          captureDir = 1; // Right
+      } else if (abs(dy_from_last) > abs(dx_from_last) * 1.1 &&
+                 distance > overlapRatioTrigger * 0.1) {
+        if (dy_from_last > 0 && allowDown)
+          captureDir = 2; // Down
+        else if (dy_from_last < 0 && allowUp)
+          captureDir = 3; // Up
+      }
+
+      int targetRow = gridY;
+      int targetCol = gridX;
+      if (captureDir == 1)
+        targetCol++;
+      else if (captureDir == 2)
+        targetRow++;
+      else if (captureDir == 3)
+        targetRow--;
+
+      int cropX = bgrFrame.cols * 0.08;
+      int cropY = bgrFrame.rows * 0.08;
+      int cropW = bgrFrame.cols - 2 * cropX;
+      int cropH = bgrFrame.rows - 2 * cropY;
+      Mat cropped = bgrFrame(Rect(cropX, cropY, cropW, cropH)).clone();
+
+      capturedFrames.push_back({cropped, targetRow, targetCol});
+      capturedPositions.push_back(Point2f(tracking_x, tracking_y));
+      isCaptured = true;
+    }
+  } else if (distance >= overlapRatioTrigger * 0.85 &&
+             distance < overlapRatioTrigger * 1.5) {
     bool validAlignment = false;
 
     // Enforce strict straight-line movements, preventing diagonal drift
@@ -168,6 +227,15 @@ Java_com_example_shelf_1scanner_MainActivity_processFrameNative(
       }
       holdingProgress = (double)(current_time_ms - hold_start_ms) / 300.0;
       if (holdingProgress >= 1.0) {
+        int targetRow = gridY;
+        int targetCol = gridX;
+        if (captureDir == 1)
+          targetCol++;
+        else if (captureDir == 2)
+          targetRow++;
+        else if (captureDir == 3)
+          targetRow--;
+
         // Crop frame to match the center "Capture Box" UI
         int cropX = bgrFrame.cols * 0.08;
         int cropY = bgrFrame.rows * 0.08;
@@ -175,7 +243,7 @@ Java_com_example_shelf_1scanner_MainActivity_processFrameNative(
         int cropH = bgrFrame.rows - 2 * cropY;
         Mat cropped = bgrFrame(Rect(cropX, cropY, cropW, cropH)).clone();
 
-        capturedFrames.push_back({cropped, gridY, gridX});
+        capturedFrames.push_back({cropped, targetRow, targetCol});
         capturedPositions.push_back(Point2f(tracking_x, tracking_y));
         isCaptured = true;
         dx_from_last = 0.0;
@@ -287,9 +355,21 @@ Java_com_example_shelf_1scanner_MainActivity_getCapturedFramesNative(
   if (capturedFrames.empty())
     return env->NewStringUTF("");
 
+  int64_t timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+
   std::string result = "";
   for (size_t i = 0; i < capturedFrames.size(); i++) {
-    std::string fileName = "/frame_" + std::to_string(i) + ".jpg";
+    std::string colLetter = getExcelColumnName(capturedFrames[i].col);
+
+    // Naming format: [Coord]_[DisplayIndex]_[Timestamp]_[Dimension].jpg
+    // DisplayIndex starts at 1 now.
+    std::string fileName =
+        "/" + colLetter + std::to_string(capturedFrames[i].row) + "_" +
+        std::to_string(i + 1) + "_" + std::to_string(timestamp) + "_" +
+        std::to_string(capturedFrames[i].image.cols) + "x" +
+        std::to_string(capturedFrames[i].image.rows) + ".jpg";
     std::string fullPath = outputDir + fileName;
 
     imwrite(fullPath, capturedFrames[i].image);

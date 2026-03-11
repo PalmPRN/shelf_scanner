@@ -30,6 +30,18 @@ class _ScannerScreenState extends State<ScannerScreen> {
 
   CameraImage? _lastCameraImage;
 
+  String _getExcelCoord(int col, int row) {
+    if (col <= 0) return "?$row";
+    String colName = "";
+    int c = col;
+    while (c > 0) {
+      int mod = (c - 1) % 26;
+      colName = String.fromCharCode(65 + mod) + colName;
+      c = (c - mod) ~/ 26;
+    }
+    return "$colName$row";
+  }
+
   bool get _allowRight {
     // If we haven't finished the first column, we don't know the height/maxGridY yet.
     // However, the user must be able to signal they are at the bottom of the shelf.
@@ -79,7 +91,25 @@ class _ScannerScreenState extends State<ScannerScreen> {
     });
   }
 
-  void _startScan() {
+  Future<void> _startScan() async {
+    // Clear Flutter's internal image memory cache to prevent "ghost" images
+    PaintingBinding.instance.imageCache.clear();
+    PaintingBinding.instance.imageCache.clearLiveImages();
+
+    // Cleanup old temporary frame images from disk BEFORE starting
+    final dir = await getApplicationDocumentsDirectory();
+    try {
+      final List<FileSystemEntity> oldFiles = dir.listSync();
+      for (var file in oldFiles) {
+        // More aggressive cleanup: delete any jpg file in the temp dir
+        if (file.path.endsWith('.jpg')) {
+          try {
+            file.deleteSync();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
     setState(() {
       _isScanning = true;
       _capturedCount = 0;
@@ -88,20 +118,8 @@ class _ScannerScreenState extends State<ScannerScreen> {
       _maxGridY = null;
     });
 
-    // Cleanup old temporary frame images from disk
-    getApplicationDocumentsDirectory().then((dir) {
-      final oldFiles = dir.listSync();
-      for (var file in oldFiles) {
-        if (file.path.contains('frame_') && file.path.endsWith('.jpg')) {
-          try {
-            file.deleteSync();
-          } catch (_) {}
-        }
-      }
-    });
-
     // Let Native code know we are starting a scan and clear cached frames
-    _channel.invokeMethod('startScan');
+    await _channel.invokeMethod('startScan');
 
     // Start realtime image stream
     // Flutter camera image stream to platform channel communication
@@ -220,6 +238,19 @@ class _ScannerScreenState extends State<ScannerScreen> {
       };
     }).toList();
 
+    int maxCol = 1;
+    for (var f in frames) {
+      if (f['col'] > maxCol) maxCol = f['col'];
+    }
+
+    // Sort by Row then Column for a true horizontal Shelf/Excel layout
+    // Row 1: A1, B1, C1 (Left to Right)
+    // Row 2: A2, B2, C2
+    frames.sort((a, b) {
+      if (a['row'] != b['row']) return a['row'].compareTo(b['row']);
+      return a['col'].compareTo(b['col']);
+    });
+
     if (!mounted) return;
 
     showModalBottomSheet(
@@ -256,10 +287,13 @@ class _ScannerScreenState extends State<ScannerScreen> {
               Expanded(
                 child: GridView.builder(
                   controller: scrollController,
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 2,
-                    crossAxisSpacing: 10,
-                    mainAxisSpacing: 10,
+                  padding: const EdgeInsets.only(bottom: 40),
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    // Match the actual shelf width
+                    crossAxisCount: maxCol > 1 ? maxCol : 2,
+                    crossAxisSpacing: 8,
+                    mainAxisSpacing: 8,
+                    childAspectRatio: 0.75, // Better for shelf photos
                   ),
                   itemCount: frames.length,
                   itemBuilder: (ctx, idx) {
@@ -280,13 +314,16 @@ class _ScannerScreenState extends State<ScannerScreen> {
                                 onPressed: () => Navigator.pop(context),
                               ),
                               title: Text(
-                                'Row ${f['row']}, Col ${f['col']}',
+                                _getExcelCoord(f['col'], f['row']),
                                 style: const TextStyle(color: Colors.white),
                               ),
                             ),
                             body: Center(
                               child: InteractiveViewer(
-                                child: Image.file(File(f['path'])),
+                                child: Image.file(
+                                  File(f['path']),
+                                  key: ValueKey(f['path']),
+                                ),
                               ),
                             ),
                           ),
@@ -299,6 +336,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                               borderRadius: BorderRadius.circular(8),
                               child: Image.file(
                                 File(f['path']),
+                                key: ValueKey(f['path']),
                                 fit: BoxFit.cover,
                               ),
                             ),
@@ -316,7 +354,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                                 borderRadius: BorderRadius.circular(4),
                               ),
                               child: Text(
-                                'Row ${f['row']}, Col ${f['col']}',
+                                _getExcelCoord(f['col'], f['row']),
                                 style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 10,
@@ -754,8 +792,8 @@ class ViewfinderPainter extends CustomPainter {
 
     // Relative position of the "Next Capture Point" in screen space
     // Scale factor: move target bubble inside the capture box
-    // 1.0 ratio = 40% of box size
-    final double scale = boxSize.width * 0.4;
+    // 0.7 ratio = 70% of box size (increased for more visual distance)
+    final double scale = boxSize.width * 0.7;
     final Offset bubblePos =
         center + (targetOffset - currentOffset) * (scale / threshold);
 
